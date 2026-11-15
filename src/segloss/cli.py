@@ -12,9 +12,11 @@ from torch.utils.data import DataLoader
 
 from segloss import contrast as C
 from segloss.losses import tol_f1
+from segloss.metrics import CenterlineReference
 from segloss.models.unet import UNet
 from segloss.synthetic import synthetic_set
 from segloss.training import Crops, TrainConfig, forward_scores, make_optimizer, normalize, train_step
+from segloss.variational import VariationalSegNet
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +26,9 @@ def build_parser() -> argparse.ArgumentParser:
                     "training steps of a small U-Net with the contrast-weighted tolerance-F1 (CTF) loss.")
     ap.add_argument("--loss", choices=["centerline", "dice_bce"], default="centerline",
                     help="'centerline' = CTF loss (default); 'dice_bce' = BCE + soft Dice reference")
+    ap.add_argument("--head", choices=["none", "tv_iso", "tv_dir", "full"], default="none",
+                    help="optional end-to-end TV layer after the U-Net (default none)")
+    ap.add_argument("--tv-iters", type=int, default=30, help="unrolled TV iterations K (default 30)")
     ap.add_argument("--steps", type=int, default=30, help="training steps (default 30)")
     ap.add_argument("--images", type=int, default=6, help="number of synthetic training images (default 6)")
     ap.add_argument("--size", type=int, default=128, help="synthetic image side in pixels (default 128)")
@@ -53,7 +58,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = TrainConfig(loss=a.loss, beta=a.beta, radius=a.radius, lr=a.lr, warmup=max(1, a.steps // 10),
                       iters=a.steps)
-    net = UNet(1, 1, base_filters=a.base_filters, depth=a.depth)
+    if a.head == "none":
+        net = UNet(1, 1, base_filters=a.base_filters, depth=a.depth)
+    else:
+        net = VariationalSegNet({"mode": a.head, "base_filters": a.base_filters, "depth": a.depth,
+                                 "var": {"K": a.tv_iters}, "compile": False})
     opt, sched = make_optimizer(net, cfg)
     ds = Crops([normalize(i) for i in train_imgs], train_labs, lowc, a.crop, a.steps * a.batch, seed=(a.seed, 0))
     net.train()
@@ -66,13 +75,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     net.eval()
     with torch.no_grad():
         x = torch.from_numpy(normalize(imgs[-1]))[None]
-        u = forward_scores(net, x)["u"]
+        f = net(x) if a.head != "none" else forward_scores(net, x)
+        u = f["u"]
         y = torch.from_numpy(labs[-1].astype(np.float32))[None, None]
         k = torch.from_numpy(C.low_contrast_indicator(imgs[-1], c_thr))[None, None]
         F_all, P, R = tol_f1(u, y, a.radius)
         _, _, R_lc = tol_f1(u, y * k, a.radius)
     print(f"unseen synthetic image: soft tolerance P={float(P):.3f} R={float(R):.3f} F1={float(F_all):.3f}; "
           f"low-contrast soft recall={float(R_lc):.3f}")
+    ref = CenterlineReference(labs[-1], C.contrast_map(imgs[-1]), c_thr, a.radius, 10.0, full_width=False)
+    m = ref.evaluate(u[0, 0].numpy() > 0.5)
+    print(f"  at threshold 0.5 (skeleton, Euclidean tolerance {a.radius}px): cl-P={m['cl_precision']:.3f} "
+          f"cl-R={m['cl_recall']:.3f} LC-R={m['lc_recall']:.3f} HC-R={m['hc_recall']:.3f}")
+    if a.head != "none":
+        print(f"  TV layer: mean lambda={float(f['lam'].mean()):.4f}  mean |u - p|={float((f['u'] - f['p']).abs().mean()):.4f}")
     print(f"done in {time.time() - t0:.1f} s")
     return 0
 

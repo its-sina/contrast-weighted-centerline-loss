@@ -94,11 +94,17 @@ def make_optimizer(net: torch.nn.Module, cfg: TrainConfig):
 
 def train_step(net: torch.nn.Module, opt: torch.optim.Optimizer, sched, batch: List[torch.Tensor],
                cfg: TrainConfig) -> Dict[str, float]:
-    """One optimisation step on a batch (x, y, kappa); returns the loss, gradient norm and loss diagnostics."""
+    """One optimisation step on a batch (x, y, kappa); returns the loss, gradient norm and loss diagnostics.
+
+    ``net`` is a plain logit network (e.g. ``UNet``) or a ``VariationalSegNet``; for the latter's TV modes the BCE
+    term is computed on the clamped layer output instead of the logit."""
     x, y, c = batch
-    f = forward_scores(net, x)
+    if hasattr(net, "is_var"):                     # VariationalSegNet: scores u may be the TV layer output
+        f, on_logit = net(x), not net.is_var
+    else:
+        f, on_logit = forward_scores(net, x), True
     omega = 1 + cfg.beta * c if cfg.loss == "centerline" and cfg.beta > 0 else None
-    loss, info = LS.loss(cfg.loss, f, y, cfg.radius, omega, on_logit=True)
+    loss, info = LS.loss(cfg.loss, f, y, cfg.radius, omega, on_logit=on_logit)
     if not torch.isfinite(loss):
         raise FloatingPointError("non-finite loss")
     opt.zero_grad(set_to_none=True)
